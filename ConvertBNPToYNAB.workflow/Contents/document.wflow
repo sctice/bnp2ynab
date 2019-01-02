@@ -1,0 +1,335 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>AMApplicationBuild</key>
+	<string>444.7</string>
+	<key>AMApplicationVersion</key>
+	<string>2.8</string>
+	<key>AMDocumentVersion</key>
+	<string>2</string>
+	<key>actions</key>
+	<array>
+		<dict>
+			<key>action</key>
+			<dict>
+				<key>AMAccepts</key>
+				<dict>
+					<key>Container</key>
+					<string>List</string>
+					<key>Optional</key>
+					<true/>
+					<key>Types</key>
+					<array>
+						<string>com.apple.cocoa.string</string>
+					</array>
+				</dict>
+				<key>AMActionVersion</key>
+				<string>2.0.3</string>
+				<key>AMApplication</key>
+				<array>
+					<string>Automator</string>
+				</array>
+				<key>AMParameterProperties</key>
+				<dict>
+					<key>COMMAND_STRING</key>
+					<dict/>
+					<key>CheckedForUserDefaultShell</key>
+					<dict/>
+					<key>inputMethod</key>
+					<dict/>
+					<key>shell</key>
+					<dict/>
+					<key>source</key>
+					<dict/>
+				</dict>
+				<key>AMProvides</key>
+				<dict>
+					<key>Container</key>
+					<string>List</string>
+					<key>Types</key>
+					<array>
+						<string>com.apple.cocoa.string</string>
+					</array>
+				</dict>
+				<key>ActionBundlePath</key>
+				<string>/System/Library/Automator/Run Shell Script.action</string>
+				<key>ActionName</key>
+				<string>Run Shell Script</string>
+				<key>ActionParameters</key>
+				<dict>
+					<key>COMMAND_STRING</key>
+					<string>#!/usr/bin/ruby
+#encoding: UTF-8
+
+require 'csv'
+
+def handle_file(in_path)
+  # Skip non-CSV file extensions.
+  return if !in_path.end_with?(".csv")
+
+  out_filename = File.basename(in_path, '.*') + '.YNAB.csv'
+  out_path = File.join(File.dirname(in_path), 'YNAB', out_filename)
+  ensure_directory(out_path)
+
+  File.open(in_path, "r:ISO-8859-1") do |in_io|
+    File.open(out_path, 'w') do |out_io|
+      BnpToYnab.convert(in_io, out_io)
+    end
+  end
+
+  File.delete(in_path)
+end
+
+def ensure_directory(path)
+  dirname = File.dirname(path)
+  if !File.directory?(dirname)
+    Dir.mkdir(dirname)
+  end
+end
+
+module BnpToYnab
+  def self.convert(in_io, out_io)
+    out_io &lt;&lt; Transaction.ynab_header
+    Transaction.each(in_io) do |trx|
+      out_io &lt;&lt; trx.to_ynab
+    end
+  end
+
+  class Transaction
+    def self.each(io)
+      # The BNP CSV starts with two bogus lines: a summary (dates covered,
+      # total of amounts), and a line of empty values. Fortunately, we can skip
+      # them with a regex, and CSV will parse the first non-skipped line as a
+      # line of headers.
+      opts = {
+        :headers =&gt; true,
+        :skip_lines =&gt; /(?:^Compte)|^,{4}/
+      }
+
+      CSV.new(io, opts).each do |row|
+        yield Transaction.new(row)
+      end
+    end
+
+    def self.ynab_header
+      ['Date', 'Payee', 'Memo', 'Outflow', 'Inflow'].to_csv
+    end
+
+    def initialize(row)
+      @date = Date.parse(row['Date operation'])
+      @memo = row['Libelle operation']
+      @name = BnpToYnab.parse_name(@memo)
+      @category = BnpToYnab.parse_category(row['Categorie operation'])
+      @amount, @type = BnpToYnab.parse_amount(row['Montant operation'])
+      @outflow = self.type === :outflow ? self.amount : 0.00
+      @inflow = self.type === :inflow ? self.amount : 0.00
+    end
+
+    attr_reader :date, :name, :type, :amount, :memo, :outflow, :inflow
+
+    # Date,Payee,Category,Memo,Outflow,Inflow
+    def to_ynab
+      [
+        @date.strftime('%Y-%m-%d'),
+        @name,
+        @memo,
+        sprintf('%.2f', @outflow),
+        sprintf('%.2f', @inflow),
+      ].to_csv
+    end
+  end
+
+  def self.parse_name(str)
+    [
+      method(:parse_facture),
+      method(:parse_retrait),
+      method(:parse_prlv),
+      method(:parse_de),
+      method(:parse_ben),
+    ].each do |p|
+      name = p.(str)
+      return name if !name.nil?
+    end
+    str
+  end
+
+  def self.parse_de(str)
+    # VIR SEPA RECU /DE SOMEBODY /MOTIF LOYER. BISOU
+    m = %r{/DE ((?:[^/]|/(?!MOTIF))*)}.match(str)
+    m.nil? ? m : m[1].strip
+  end
+
+  def self.parse_ben(str)
+    # VIREMENT SEPA EMIS /MOTIF CHAMPAGNE /BEN SOMEBODY /RE
+    m = %r{/BEN ((?:[^/]|/(?!RE))*)}.match(str)
+    m.nil? ? m : m[1].strip
+  end
+
+  def self.parse_prlv(str)
+    # PRLV SEPA D.G.F.I.P IMPOT 99999 ECH/271218 ID EMET
+    m = %r{^PRLV SEPA ((?:[^E]|E(?!CH))*)}.match(str)
+    m.nil? ? m : m[1].strip
+  end
+
+  def self.parse_facture(str)
+    # FACTURE CARTE DU 261218 SOMEWHERE CARTE 9999XXXXX
+    m = %r{^FACTURE CARTE DU \d+ ((?:[^E]|E(?!CH))*)}.match(str)
+    m.nil? ? m : m[1].gsub(/CART?E? ?\d*X*/, '').strip
+  end
+
+  def self.parse_retrait(str)
+    # RETRAIT DAB 23/12/18 10H59 99999999 SOMEWHERE
+    m = %r{^RETRAIT DAB \d+/\d+/\d+ \d+H\d+ \d+ (.*)}.match(str)
+    m.nil? ? m : m[1]
+  end
+
+  def self.parse_category(str)
+    str === 'Non défini' ? '' : str
+  end
+
+  # BNP exports prices that look like normal floats, so all we need to do is
+  # convert them.
+  def self.parse_amount(str)
+    amount = str.to_f
+    type = amount &lt; 0 ? :outflow : :inflow
+    [amount.abs, type]
+  end
+end
+
+begin
+  ARGV.each { |in_path| handle_file(in_path) }
+rescue Interrupt
+end
+</string>
+					<key>CheckedForUserDefaultShell</key>
+					<true/>
+					<key>inputMethod</key>
+					<integer>1</integer>
+					<key>shell</key>
+					<string>/usr/bin/ruby</string>
+					<key>source</key>
+					<string></string>
+				</dict>
+				<key>BundleIdentifier</key>
+				<string>com.apple.RunShellScript</string>
+				<key>CFBundleVersion</key>
+				<string>2.0.3</string>
+				<key>CanShowSelectedItemsWhenRun</key>
+				<false/>
+				<key>CanShowWhenRun</key>
+				<true/>
+				<key>Category</key>
+				<array>
+					<string>AMCategoryUtilities</string>
+				</array>
+				<key>Class Name</key>
+				<string>RunShellScriptAction</string>
+				<key>InputUUID</key>
+				<string>30977E32-3FC6-49E7-A12F-7B116BEA7A3D</string>
+				<key>Keywords</key>
+				<array>
+					<string>Shell</string>
+					<string>Script</string>
+					<string>Command</string>
+					<string>Run</string>
+					<string>Unix</string>
+				</array>
+				<key>OutputUUID</key>
+				<string>34B5E5B8-D20A-4032-91DF-BD2D4DEC444D</string>
+				<key>UUID</key>
+				<string>2AA031F2-1114-495D-A0EF-CB912B894D5F</string>
+				<key>UnlocalizedApplications</key>
+				<array>
+					<string>Automator</string>
+				</array>
+				<key>arguments</key>
+				<dict>
+					<key>0</key>
+					<dict>
+						<key>default value</key>
+						<integer>0</integer>
+						<key>name</key>
+						<string>inputMethod</string>
+						<key>required</key>
+						<string>0</string>
+						<key>type</key>
+						<string>0</string>
+						<key>uuid</key>
+						<string>0</string>
+					</dict>
+					<key>1</key>
+					<dict>
+						<key>default value</key>
+						<string></string>
+						<key>name</key>
+						<string>source</string>
+						<key>required</key>
+						<string>0</string>
+						<key>type</key>
+						<string>0</string>
+						<key>uuid</key>
+						<string>1</string>
+					</dict>
+					<key>2</key>
+					<dict>
+						<key>default value</key>
+						<false/>
+						<key>name</key>
+						<string>CheckedForUserDefaultShell</string>
+						<key>required</key>
+						<string>0</string>
+						<key>type</key>
+						<string>0</string>
+						<key>uuid</key>
+						<string>2</string>
+					</dict>
+					<key>3</key>
+					<dict>
+						<key>default value</key>
+						<string></string>
+						<key>name</key>
+						<string>COMMAND_STRING</string>
+						<key>required</key>
+						<string>0</string>
+						<key>type</key>
+						<string>0</string>
+						<key>uuid</key>
+						<string>3</string>
+					</dict>
+					<key>4</key>
+					<dict>
+						<key>default value</key>
+						<string>/bin/sh</string>
+						<key>name</key>
+						<string>shell</string>
+						<key>required</key>
+						<string>0</string>
+						<key>type</key>
+						<string>0</string>
+						<key>uuid</key>
+						<string>4</string>
+					</dict>
+				</dict>
+				<key>isViewVisible</key>
+				<true/>
+				<key>location</key>
+				<string>309.000000:253.000000</string>
+				<key>nibPath</key>
+				<string>/System/Library/Automator/Run Shell Script.action/Contents/Resources/English.lproj/main.nib</string>
+			</dict>
+			<key>isViewVisible</key>
+			<true/>
+		</dict>
+	</array>
+	<key>connectors</key>
+	<dict/>
+	<key>workflowMetaData</key>
+	<dict>
+		<key>folderActionFolderPath</key>
+		<string>~/Desktop/MyBNP</string>
+		<key>workflowTypeIdentifier</key>
+		<string>com.apple.Automator.folderAction</string>
+	</dict>
+</dict>
+</plist>
